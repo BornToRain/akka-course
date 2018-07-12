@@ -1,0 +1,94 @@
+package btr.akka.course.chapter3.infrastructure.tool
+
+import scala.language.postfixOps
+
+/**
+  * 分布式雪花全局ID生成器
+  * tweeter的snowflake算法
+  * id构成:42位的时间前缀+5位的数据节点标识+5位机器id+12位的sequence避免并发的数字(12位不够用时强制得到新的时间前缀)
+  * 42位时间戳可以使用(2的42次方-1)/(1000360024*365)=139.5年
+  * 10机器编码支持最多部署1024个节点
+  * 12位sequence可以表示4096个数字,它是在time相同的情况下，递增该值直到为0，
+  * 即一个循环结束，此时便只能等到下一个ms到来，一般情况下4096/ms的请求是不太可能出现的，所以足够使用了。
+  * Created by ryze on 2017/5/11.
+  */
+class IdWorker(workerId: Int, dataCenterId: Int)
+{
+  //开始时间
+  private[this] val startEpoch         = 1531367068000L
+  //机器编码所占位数
+  private[this] val workerIdBits       = 5L
+  //数据中心标识所占位数
+  private[this] val dataCenterIdBits   = 5L
+  //支持的最大机器编码(这个移位算法可以很快计算出几位二进制数能表示的最大十进制数)
+  private[this] val maxWorkerId        = -1L ^ (-1L << workerIdBits)
+  //支持的最大数据标识
+  private[this] val maxDataCenterId    = -1L ^ (-1L << dataCenterIdBits)
+  private[this] val sequenceBits       = 12L
+  //机器编码<<12
+  private[this] val workerIdShift      = sequenceBits
+  //数据中心标识<<12+5
+  private[this] val dataCenterIdShift  = sequenceBits + workerIdBits
+  //时间戳<<12+10
+  private[this] val timestampLeftShift = sequenceBits + workerIdBits + dataCenterIdBits
+  //生成序列的掩码, 0xfff=4095
+  private[this] val sequenceMask       = -1L ^ (-1L << sequenceBits)
+
+  //毫秒内序列 0-4095
+  private[this] var sequence           = 0L
+  //生成Id的时间戳
+  private[this] var lastTimestamp      = -1L
+
+  require(workerId <= maxWorkerId && workerId >= 0,
+    s"工作Id不能大于${maxWorkerId}或者小于0")
+  require(dataCenterId <= maxDataCenterId && dataCenterId >= 0,
+    s"数据中心Id不能大于${maxDataCenterId}或者小于0")
+
+  /**
+    * 生成以毫秒为单位的当前时间
+    */
+  @inline
+  private[this] def timeGenerator = System currentTimeMillis
+
+  /**
+    * 阻塞到下一毫秒,获得新的时间戳
+    */
+  @inline
+  private[this] def blockNextMillis(lastTimeStamp: Long) =
+  {
+    val timestamp = timeGenerator
+    if (timestamp <= lastTimestamp) timeGenerator
+    else timestamp
+  }
+
+  /**
+    * 获得下一个ID (该方法是线程安全的)
+    */
+  @inline
+  def nextId = synchronized
+  {
+    val timeStamp = timeGenerator
+    //当前时间戳小于上一次Id生成的时间戳,说明系统时间回退过,这个时候应当抛出异常
+    if(timeStamp < lastTimestamp) throw new RuntimeException(s"系统时间不正常,拒绝为${lastTimestamp - timeStamp}毫秒生成id")
+    else if(timeStamp == lastTimestamp)
+    {
+      sequence = (sequence + 1) & sequenceMask
+      //毫秒内序列溢出
+      if (0 == sequence) blockNextMillis(lastTimestamp)
+    }
+    //时间戳改变,毫秒内序列重置
+    else sequence = 0L
+    //上次生成ID的时间戳
+    lastTimestamp = timeStamp
+    ((timeStamp - startEpoch) << timestampLeftShift) | (dataCenterId << dataCenterIdShift) | (workerId << workerIdShift) | sequence
+  }
+}
+
+object IdWorker
+{
+  //默认一台机器一个节点 单Worker实例
+  private[this] val flowIdWorker = new IdWorker(1, 1)
+
+  @inline
+  final def getId = flowIdWorker.nextId + ""
+}
